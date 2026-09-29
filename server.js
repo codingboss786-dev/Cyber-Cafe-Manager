@@ -12,7 +12,7 @@ import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const STATIC_DIR = path.join(__dirname, '..');
+const STATIC_DIR = __dirname;
 
 const app = express();
 const PORT = process.env.PORT || 5000;
