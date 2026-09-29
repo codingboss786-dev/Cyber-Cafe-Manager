@@ -12,7 +12,7 @@ import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const STATIC_DIR = __dirname;
+const STATIC_DIR = path.join(__dirname, '..');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -24,11 +24,7 @@ app.set('trust proxy', 1);
 const MONGO_URI = process.env.MONGO_URI ||
   'mongodb+srv://codingboss786_db_user:94YJq2T7bgLtRVL1@cluster0.io9awoj.mongodb.net/cybercafe?retryWrites=true&w=majority&appName=Cluster0';
 
-app.use(cors({
-  origin: ['https://cyber-cafe-manager-sk.netlify.app', 'http://localhost:5000', 'http://localhost:3000'],
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS']
-}));
+app.use(cors({ origin: true, credentials: true }));
 app.use(express.json({ limit: '10mb' }));
 
 /* Lightweight logger (only non-static) */
