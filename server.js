@@ -1,12 +1,14 @@
 /* ==================================================================
-   CYBER CAFE MANAGER — Server v4.4 (Fast + Reliable)
-   MongoDB Atlas: cluster0.io9awoj.mongodb.net
-   FIXES: Better DB retry, Trust proxy for Cloud Shell, Fast sync
+   CYBER CAFE MANAGER — Server v5.0
+   - Server-side password auth (MongoDB में)
+   - Session tokens
+   - All data in MongoDB
    ================================================================== */
 
 import express from 'express';
 import mongoose from 'mongoose';
 import cors from 'cors';
+import crypto from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -16,18 +18,16 @@ const STATIC_DIR = path.join(__dirname, '..');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
-
-/* ⭐ Trust proxy — important for Cloud Shell / reverse proxies */
 app.set('trust proxy', 1);
 
-/* ============================ MONGODB ============================ */
 const MONGO_URI = process.env.MONGO_URI ||
   'mongodb+srv://codingboss786_db_user:94YJq2T7bgLtRVL1@cluster0.io9awoj.mongodb.net/cybercafe?retryWrites=true&w=majority&appName=Cluster0';
 
+// ✅ CORS — allow all origins (Netlify, localhost, etc.)
 app.use(cors({ origin: true, credentials: true }));
 app.use(express.json({ limit: '10mb' }));
 
-/* Lightweight logger (only non-static) */
+// Logger
 app.use((req, _res, next) => {
   if (!req.path.startsWith('/api/')) return next();
   const t = Date.now();
@@ -37,18 +37,16 @@ app.use((req, _res, next) => {
   next();
 });
 
-/* ⭐ SECURITY: Block sensitive server files */
-const BLOCKED_PATHS = ['/server', '/node_modules', '/package.json', '/package-lock.json', '/.env', '/.git', '/.gitignore'];
+// Block sensitive paths
+const BLOCKED = ['/server', '/node_modules', '/package.json', '/package-lock.json', '/.env', '/.git'];
 app.use((req, res, next) => {
-  if (BLOCKED_PATHS.some(p => req.path === p || req.path.startsWith(p + '/'))) {
-    return res.status(403).send('Forbidden');
-  }
+  if (BLOCKED.some(p => req.path === p || req.path.startsWith(p + '/'))) return res.status(403).send('Forbidden');
   next();
 });
 
-/* ============================ DB CONNECT ============================ */
+/* ============================ DATABASE ============================ */
 let dbConnected = false;
-let dbState = 'connecting'; // 'connected' | 'connecting' | 'offline'
+let dbState = 'connecting';
 
 async function connectDB() {
   try {
@@ -58,12 +56,11 @@ async function connectDB() {
       socketTimeoutMS: 45000,
       connectTimeoutMS: 8000,
       maxPoolSize: 10,
-      retryWrites: true
     });
     dbConnected = true;
     dbState = 'connected';
     console.log('✅ MongoDB Atlas connected');
-    console.log(`📦 DB: ${mongoose.connection.name} · Host: ${mongoose.connection.host}`);
+    console.log(`📦 DB: ${mongoose.connection.name} · ${mongoose.connection.host}`);
   } catch (err) {
     dbConnected = false;
     dbState = 'offline';
@@ -75,18 +72,13 @@ async function connectDB() {
 connectDB();
 
 mongoose.connection.on('disconnected', () => {
-  console.warn('⚠️  MongoDB disconnected');
-  dbConnected = false;
-  dbState = 'offline';
+  dbConnected = false; dbState = 'offline';
   setTimeout(connectDB, 5000);
 });
 mongoose.connection.on('reconnected', () => {
-  console.log('✅ MongoDB reconnected');
-  dbConnected = true;
-  dbState = 'connected';
+  dbConnected = true; dbState = 'connected';
 });
 
-/* ============================ MIDDLEWARE ============================ */
 const guard = (_req, res, next) => {
   if (!dbConnected) return res.status(503).json({ error: 'Database offline', offline: true });
   next();
@@ -106,63 +98,207 @@ const Rate       = gen('Rate',       { id: { type: String, unique: true, index: 
 const Settings   = gen('Settings',   { _key: { type: String, unique: true, default: 'main' } });
 const Commission = gen('Commission', { year: Number, month: Number, amount: Number });
 const KV         = gen('KV',         { _key: { type: String, unique: true, index: true }, value: mongoose.Schema.Types.Mixed });
+const Session    = gen('Session',    { token: { type: String, unique: true, index: true }, expiresAt: Date });
 
-/* ============================ HEALTH (fast) ============================ */
-app.get('/api/health', (_req, res) => {
-  res.json({
-    server: 'ok',
-    db: dbState,                                    // 'connected' | 'connecting' | 'offline'
-    dbConnected,
-    dbName: dbConnected ? mongoose.connection.name : null,
-    host: dbConnected ? mongoose.connection.host : null,
-    ts: new Date().toISOString()
-  });
-});
+/* ============================ AUTH (Server-side) ============================ */
+const SESSION_TTL_MS = 15 * 60 * 1000;   // 15 min sliding
+const MAX_ATTEMPTS = 5;
+const LOCK_BASE_SECONDS = 30;
+const loginAttempts = new Map();          // in-memory per-IP tracker
 
-app.get('/api/test-connection', async (_req, res) => {
-  const state = mongoose.connection.readyState;
-  const states = { 0: 'disconnected', 1: 'connected', 2: 'connecting', 3: 'disconnecting' };
-  res.json({
-    status: states[state] || 'unknown',
-    dbConnected,
-    host: mongoose.connection.host || null,
-    dbName: mongoose.connection.name || null,
-    models: mongoose.modelNames(),
-    ts: new Date().toISOString()
-  });
-});
+function hashPassword(password, salt) {
+  const str = salt + '::' + password + '::cybercafe_v3';
+  return crypto.createHash('sha256').update(str).digest('hex');
+}
 
-app.get('/api/debug', async (_req, res) => {
-  if (!dbConnected) return res.json({ dbConnected: false, counts: null });
+async function createSession() {
+  const token = crypto.randomBytes(32).toString('hex');
+  const expiresAt = new Date(Date.now() + SESSION_TTL_MS);
+  await Session.create({ token, expiresAt });
+  Session.deleteMany({ expiresAt: { $lt: new Date() } }).catch(() => {});
+  return { token, expiresAt: expiresAt.getTime() };
+}
+
+async function validateSession(token) {
+  if (!token) return false;
+  const s = await Session.findOne({ token }).lean();
+  if (!s) return false;
+  if (new Date(s.expiresAt) < new Date()) {
+    await Session.deleteOne({ token });
+    return false;
+  }
+  // sliding expiry
+  await Session.updateOne({ token }, { expiresAt: new Date(Date.now() + SESSION_TTL_MS) });
+  return true;
+}
+
+const requireAuth = async (req, res, next) => {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (!await validateSession(token)) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  next();
+};
+
+/* --- AUTH ENDPOINTS --- */
+app.get('/api/auth/status', async (req, res) => {
+  if (!dbConnected) return res.json({ hasPassword: false, sessionValid: false, offline: true });
   try {
-    const counts = {
-      services: await Service.countDocuments(),
-      udhaar: await Udhaar.countDocuments(),
-      expenses: await Expense.countDocuments(),
-      loans: await Loan.countDocuments(),
-      inventory: await Inventory.countDocuments(),
-      rates: await Rate.countDocuments(),
-    };
-    res.json({ dbConnected: true, counts });
+    const authDoc = await KV.findOne({ _key: 'auth' }).lean();
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    const sessionValid = token ? await validateSession(token) : false;
+    res.json({ hasPassword: !!authDoc, sessionValid });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-/* ============================ CRUD ============================ */
+app.post('/api/auth/setup', guard, async (req, res) => {
+  try {
+    const existing = await KV.findOne({ _key: 'auth' }).lean();
+    if (existing) return res.status(400).json({ error: 'Password already set' });
+    const { password } = req.body;
+    if (!password || password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    if (password.length > 128) return res.status(400).json({ error: 'Password too long' });
+    const salt = crypto.randomBytes(16).toString('hex');
+    const hash = hashPassword(password, salt);
+    await KV.create({ _key: 'auth', value: { hash, salt, createdAt: Date.now() } });
+    const session = await createSession();
+    res.json({ ok: true, ...session });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/auth/login', guard, async (req, res) => {
+  const ip = req.ip || 'unknown';
+  try {
+    const attempt = loginAttempts.get(ip) || { count: 0, lockUntil: 0 };
+    if (attempt.lockUntil > Date.now()) {
+      const sec = Math.ceil((attempt.lockUntil - Date.now()) / 1000);
+      return res.status(429).json({ error: `Too many attempts. Try again in ${sec}s` });
+    }
+    const authDoc = await KV.findOne({ _key: 'auth' }).lean();
+    if (!authDoc || !authDoc.value) return res.status(400).json({ error: 'No password set on server. Please set up first.' });
+
+    const { password } = req.body;
+    const hash = hashPassword(password || '', authDoc.value.salt);
+    if (hash !== authDoc.value.hash) {
+      attempt.count = (attempt.count || 0) + 1;
+      if (attempt.count >= MAX_ATTEMPTS) {
+        const mult = Math.pow(2, Math.floor(attempt.count / MAX_ATTEMPTS) - 1);
+        attempt.lockUntil = Date.now() + LOCK_BASE_SECONDS * mult * 1000;
+        attempt.count = 0;
+      }
+      loginAttempts.set(ip, attempt);
+      return res.status(401).json({ error: 'Wrong password' });
+    }
+    loginAttempts.delete(ip);
+    const session = await createSession();
+    res.json({ ok: true, ...session });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/auth/logout', async (req, res) => {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (token) await Session.deleteOne({ token }).catch(() => {});
+  res.json({ ok: true });
+});
+
+app.post('/api/auth/change', requireAuth, async (req, res) => {
+  try {
+    const { newPassword } = req.body;
+    if (!newPassword || newPassword.length < 6) return res.status(400).json({ error: 'New password too short' });
+    if (newPassword.length > 128) return res.status(400).json({ error: 'Password too long' });
+    const salt = crypto.randomBytes(16).toString('hex');
+    const hash = hashPassword(newPassword, salt);
+    await KV.updateOne({ _key: 'auth' }, { value: { hash, salt, createdAt: Date.now() } });
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/auth/remove', requireAuth, async (req, res) => {
+  try {
+    const authDoc = await KV.findOne({ _key: 'auth' }).lean();
+    if (!authDoc) return res.status(400).json({ error: 'No password set' });
+    const { password } = req.body;
+    const hash = hashPassword(password || '', authDoc.value.salt);
+    if (hash !== authDoc.value.hash) return res.status(401).json({ error: 'Wrong password' });
+    await KV.deleteOne({ _key: 'auth' });
+    await Session.deleteMany({});
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/* ============================ HEALTH ============================ */
+app.get('/api/health', (_req, res) => {
+  res.json({
+    server: 'ok', db: dbState, dbConnected,
+    dbName: dbConnected ? mongoose.connection.name : null,
+    ts: new Date().toISOString()
+  });
+});
+
+/* ============================ ALL DATA (single fetch) ============================ */
+function stripMongo(obj) {
+  if (!obj || typeof obj !== 'object') return obj;
+  const { _id, __v, createdAt, updatedAt, _key, ...rest } = obj;
+  return rest;
+}
+
+app.get('/api/all', requireAuth, async (_req, res) => {
+  if (!dbConnected) return res.json({
+    services: [], udhaar: [], expenses: [], loans: [], inventory: [],
+    rates: [], settings: null, commissions: {}, notes: '', target: null
+  });
+  try {
+    const [services, udhaar, expenses, loans, inventory, rates, settings, commissions, notesKV, targetKV] = await Promise.all([
+      Service.find().sort({ date: -1 }).lean(),
+      Udhaar.find().sort({ date: -1 }).lean(),
+      Expense.find().sort({ date: -1 }).lean(),
+      Loan.find().sort({ date: -1 }).lean(),
+      Inventory.find().lean(),
+      Rate.find().lean(),
+      Settings.findOne({ _key: 'main' }).lean(),
+      Commission.find().lean(),
+      KV.findOne({ _key: 'notes' }).lean(),
+      KV.findOne({ _key: 'target' }).lean()
+    ]);
+    const commissionsGrouped = {};
+    commissions.forEach(c => {
+      if (!commissionsGrouped[c.year]) commissionsGrouped[c.year] = {};
+      commissionsGrouped[c.year][c.month] = c.amount;
+    });
+    res.json({
+      services: services.map(stripMongo),
+      udhaar: udhaar.map(stripMongo),
+      expenses: expenses.map(stripMongo),
+      loans: loans.map(stripMongo),
+      inventory: inventory.map(stripMongo),
+      rates: rates.map(stripMongo),
+      settings: settings ? stripMongo(settings) : null,
+      commissions: commissionsGrouped,
+      notes: (notesKV && notesKV.value) || '',
+      target: (targetKV && targetKV.value) || null
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/* ============================ CRUD (compatibility) ============================ */
 function crudRoutes(router, Model, sortField = 'date') {
-  router.get('/', async (_req, res) => {
+  router.get('/', requireAuth, async (_req, res) => {
     if (!dbConnected) return res.json([]);
     try { res.json(await Model.find().sort({ [sortField]: -1 }).lean()); }
     catch (e) { res.status(500).json({ error: e.message }); }
   });
-  router.post('/', guard, async (req, res) => {
+  router.post('/', requireAuth, guard, async (req, res) => {
     try { res.status(201).json(await Model.create(req.body)); }
     catch (e) { res.status(500).json({ error: e.message }); }
   });
-  router.put('/:id', guard, async (req, res) => {
+  router.put('/:id', requireAuth, guard, async (req, res) => {
     try { res.json(await Model.findOneAndUpdate({ id: req.params.id }, req.body, { new: true, upsert: true })); }
     catch (e) { res.status(500).json({ error: e.message }); }
   });
-  router.delete('/:id', guard, async (req, res) => {
+  router.delete('/:id', requireAuth, guard, async (req, res) => {
     try { await Model.deleteOne({ id: req.params.id }); res.json({ ok: true }); }
     catch (e) { res.status(500).json({ error: e.message }); }
   });
@@ -172,88 +308,21 @@ function makeRouter(Model, sortField) {
   crudRoutes(r, Model, sortField);
   return r;
 }
+app.use('/api/services',  makeRouter(Service, 'date'));
+app.use('/api/udhaar',    makeRouter(Udhaar, 'date'));
+app.use('/api/expenses',  makeRouter(Expense, 'date'));
+app.use('/api/loans',     makeRouter(Loan, 'date'));
+app.use('/api/inventory', makeRouter(Inventory, 'createdAt'));
+app.use('/api/rates',     makeRouter(Rate, 'category'));
 
-app.use('/api/services',   makeRouter(Service, 'date'));
-app.use('/api/udhaar',     makeRouter(Udhaar, 'date'));
-app.use('/api/expenses',   makeRouter(Expense, 'date'));
-app.use('/api/loans',      makeRouter(Loan, 'date'));
-app.use('/api/inventory',  makeRouter(Inventory, 'createdAt'));
-app.use('/api/rates',      makeRouter(Rate, 'category'));
-
-/* ============================ SETTINGS ============================ */
-app.get('/api/settings', async (_req, res) => {
-  if (!dbConnected) return res.json(null);
-  try {
-    const s = await Settings.findOne({ _key: 'main' }).lean();
-    res.json(s ? { ...s, _key: undefined } : null);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-app.put('/api/settings', guard, async (req, res) => {
-  try {
-    const s = await Settings.findOneAndUpdate(
-      { _key: 'main' }, { ...req.body, _key: 'main' }, { new: true, upsert: true }
-    );
-    res.json(s);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-/* ============================ COMMISSIONS ============================ */
-app.get('/api/commissions', async (_req, res) => {
-  if (!dbConnected) return res.json({});
-  try {
-    const all = await Commission.find().lean();
-    const grouped = {};
-    all.forEach(c => {
-      if (!grouped[c.year]) grouped[c.year] = {};
-      grouped[c.year][c.month] = c.amount;
-    });
-    res.json(grouped);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-app.put('/api/commissions', guard, async (req, res) => {
-  try {
-    const data = req.body;
-    for (const [year, months] of Object.entries(data)) {
-      for (const [month, amount] of Object.entries(months)) {
-        await Commission.findOneAndUpdate(
-          { year: Number(year), month: Number(month) },
-          { year: Number(year), month: Number(month), amount: Number(amount) || 0 },
-          { upsert: true }
-        );
-      }
-    }
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-/* ============================ KV (NOTES / TARGET) ============================ */
-app.get('/api/kv/:key', async (req, res) => {
-  if (!dbConnected) return res.json(null);
-  try {
-    const doc = await KV.findOne({ _key: req.params.key }).lean();
-    res.json(doc ? doc.value : null);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-app.put('/api/kv/:key', guard, async (req, res) => {
-  try {
-    const doc = await KV.findOneAndUpdate(
-      { _key: req.params.key },
-      { _key: req.params.key, value: req.body.value },
-      { new: true, upsert: true }
-    );
-    res.json(doc);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-/* ============================ BULK SYNC (with DELETE) ============================ */
-app.post('/api/sync', guard, async (req, res) => {
+/* ============================ SYNC (bulk upsert + delete) ============================ */
+app.post('/api/sync', requireAuth, guard, async (req, res) => {
   const t0 = Date.now();
   try {
     const data = req.body || {};
     const deleted = data.deleted || {};
     const result = { synced: 0, deleted: 0, errors: [] };
 
-    /* STEP 1: DELETE */
     const deleteMany = async (Model, ids) => {
       if (!Array.isArray(ids) || !ids.length) return;
       try {
@@ -262,15 +331,14 @@ app.post('/api/sync', guard, async (req, res) => {
       } catch (e) { result.errors.push(`${Model.modelName} delete: ${e.message}`); }
     };
     await Promise.all([
-      deleteMany(Service,   deleted.services),
-      deleteMany(Udhaar,    deleted.udhaar),
-      deleteMany(Expense,   deleted.expenses),
-      deleteMany(Loan,      deleted.loans),
+      deleteMany(Service, deleted.services),
+      deleteMany(Udhaar, deleted.udhaar),
+      deleteMany(Expense, deleted.expenses),
+      deleteMany(Loan, deleted.loans),
       deleteMany(Inventory, deleted.inventory),
-      deleteMany(Rate,      deleted.rates)
+      deleteMany(Rate, deleted.rates)
     ]);
 
-    /* STEP 2: UPSERT — using bulkWrite for speed */
     const bulkUpsert = async (Model, items) => {
       if (!Array.isArray(items) || !items.length) return;
       try {
@@ -285,12 +353,12 @@ app.post('/api/sync', guard, async (req, res) => {
     };
 
     await Promise.all([
-      bulkUpsert(Service,   data.services),
-      bulkUpsert(Udhaar,    data.udhaar),
-      bulkUpsert(Expense,   data.expenses),
-      bulkUpsert(Loan,      data.loans),
+      bulkUpsert(Service, data.services),
+      bulkUpsert(Udhaar, data.udhaar),
+      bulkUpsert(Expense, data.expenses),
+      bulkUpsert(Loan, data.loans),
       bulkUpsert(Inventory, data.inventory),
-      bulkUpsert(Rate,      data.rates)
+      bulkUpsert(Rate, data.rates)
     ]);
 
     if (data.settings) {
@@ -326,67 +394,23 @@ app.post('/api/sync', guard, async (req, res) => {
   }
 });
 
-/* ============================ BACKUP ============================ */
-app.get('/api/backup', async (_req, res) => {
-  if (!dbConnected) return res.status(503).json({ error: 'DB offline', offline: true });
-  try {
-    const [services, udhaar, expenses, loans, inventory, rates, settings, commissions] = await Promise.all([
-      Service.find().lean(), Udhaar.find().lean(), Expense.find().lean(),
-      Loan.find().lean(), Inventory.find().lean(), Rate.find().lean(),
-      Settings.findOne({ _key: 'main' }).lean(), Commission.find().lean()
-    ]);
-    res.json({
-      exportedAt: new Date().toISOString(), version: 3,
-      data: { services, udhaar, expenses, loans, inventory, rates,
-        settings: settings ? { ...settings, _key: undefined } : null, commissions }
-    });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-/* ============================ STATS ============================ */
-app.get('/api/stats', async (_req, res) => {
-  if (!dbConnected) return res.json({ offline: true });
-  try {
-    const [services, udhaar, expenses, loans, inventory] = await Promise.all([
-      Service.countDocuments(), Udhaar.countDocuments(), Expense.countDocuments(),
-      Loan.countDocuments(), Inventory.countDocuments()
-    ]);
-    const revenue = (await Service.find().lean()).reduce((a, s) => a + ((s.collected || 0) - (s.portalFees || 0)), 0);
-    const due = (await Udhaar.find({ status: 'pending' }).lean()).reduce((a, u) => a + Math.max(0, u.total - u.paid), 0);
-    res.json({ services, udhaar, expenses, loans, inventory, revenue, due, ts: new Date().toISOString() });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-/* ============================ SERVE FRONTEND ============================ */
-app.use(express.static(STATIC_DIR, {
-  index: 'index.html',
-  dotfiles: 'deny',
-  maxAge: '1h',
-  etag: true
-}));
-
+/* ============================ STATIC & 404 ============================ */
+app.use(express.static(STATIC_DIR, { index: 'index.html', dotfiles: 'deny' }));
 app.use((req, res, next) => {
   if (req.path.startsWith('/api/')) return next();
   res.sendFile(path.join(STATIC_DIR, 'index.html'), (err) => { if (err) next(); });
 });
-
-/* ============================ 404 & ERROR ============================ */
 app.use((_req, res) => res.status(404).json({ error: 'Endpoint not found' }));
 app.use((err, _req, res, _next) => {
   console.error('Server error:', err);
   res.status(500).json({ error: err.message });
 });
 
-/* ============================ START ============================ */
 app.listen(PORT, '0.0.0.0', () => {
   console.log('\n' + '='.repeat(60));
-  console.log('🚀 CYBER CAFE MANAGER — Server v4.4 (Fast + Reliable)');
+  console.log('🚀 CYBER CAFE MANAGER — Server v5.0 (Server-side Auth)');
   console.log('='.repeat(60));
   console.log(`🌐 App:      http://localhost:${PORT}`);
   console.log(`📊 Health:   http://localhost:${PORT}/api/health`);
-  console.log(`🐛 Debug:    http://localhost:${PORT}/api/debug`);
-  console.log(`🏢 Cluster:  cluster0.io9awoj.mongodb.net`);
-  console.log('='.repeat(60));
-  console.log('💡 Web Preview → port 5000');
   console.log('='.repeat(60) + '\n');
 });
